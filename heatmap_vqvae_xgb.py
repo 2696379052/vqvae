@@ -81,6 +81,28 @@ def count_samples(shards, label_key, max_samples=None):
     return n
 
 
+def load_sample_cache(data_dir):
+    path = os.path.join(data_dir, "sample_count_cache.json")
+    if not os.path.exists(path):
+        return {}
+    try:
+        import json
+
+        with open(path, "r", encoding="utf-8") as f:
+            data = json.load(f)
+        return data if isinstance(data, dict) else {}
+    except Exception:
+        return {}
+
+
+def get_cache_steps(cache, split, batch_size, num_classes):
+    key = f"{split}_bs{batch_size}_nc{num_classes}"
+    val = cache.get(key)
+    if isinstance(val, (int, float)) and val > 0:
+        return int(val)
+    return None
+
+
 def infer_label_key(shards):
     ds = wds.WebDataset(shards, shardshuffle=False)
     sample = next(iter(ds))
@@ -261,10 +283,24 @@ def train_vqvae(
         torch.save({"model": model.state_dict()}, save_path)
 
 
-def encode_codebook_hist(loader, model, device, n_embeddings, task, normalize_hist, max_samples):
+def encode_codebook_hist(
+    loader,
+    model,
+    device,
+    n_embeddings,
+    task,
+    normalize_hist,
+    max_samples,
+    progress,
+    desc,
+    total,
+):
     features = []
     labels = []
     model.eval()
+    pbar = None
+    if progress and tqdm is not None:
+        pbar = tqdm(total=total, desc=desc, unit="sample")
     with torch.inference_mode():
         for x, y in loader:
             x = np.asarray(x)
@@ -289,8 +325,12 @@ def encode_codebook_hist(loader, model, device, n_embeddings, task, normalize_hi
                         hist /= total
                 features.append(hist)
                 labels.append(int(y[i]))
+            if pbar is not None:
+                pbar.update(b)
             if max_samples and len(labels) >= max_samples:
                 break
+    if pbar is not None:
+        pbar.close()
     return np.asarray(features, dtype=np.float32), np.asarray(labels, dtype=np.int64)
 
 
@@ -314,50 +354,61 @@ def train_xgboost(X_train, y_train, X_val, y_val, params, rounds):
 
 def main():
     parser = argparse.ArgumentParser(description="VQ-VAE + XGBoost on heatmap shards")
-    parser.add_argument("--data-dir", default="./data")
-    parser.add_argument("--train-shards", default="")
-    parser.add_argument("--val-shards", default="")
-    parser.add_argument("--test-shards", default="")
-    parser.add_argument("--label-key", default="")
-    parser.add_argument("--task", choices=["2class", "3class"], default="2class")
+    data = parser.add_argument_group("data")
+    data.add_argument("--data-dir", default="./data", help="分片数据根目录")
+    data.add_argument("--train-shards", default="", help="训练分片 glob（逗号分隔）")
+    data.add_argument("--val-shards", default="", help="验证分片 glob（逗号分隔）")
+    data.add_argument("--test-shards", default="", help="测试分片 glob（逗号分隔）")
+    data.add_argument("--label-key", default="", help="标签字段名，例如 label_2c_1.0.cls")
+    data.add_argument("--task", choices=["2class", "3class"], default="2class", help="标签类型")
 
-    parser.add_argument("--batch-size", type=int, default=32)
-    parser.add_argument("--num-workers", type=int, default=0)
-    parser.add_argument("--shuffle-buf", type=int, default=1000)
-    parser.add_argument("--seed", type=int, default=42)
+    io = parser.add_argument_group("io")
+    io.add_argument("--feature-out-dir", default="features", help="特征保存目录（.npz）")
+    io.add_argument("--vqvae-out", default="results/vqvae_heatmap.pth", help="最优 VQ-VAE 模型路径")
+    io.add_argument("--xgb-out", default="results/xgb_model.json", help="XGBoost 模型路径")
 
-    parser.add_argument("--epochs", type=int, default=10)
-    parser.add_argument("--steps-per-epoch", type=int, default=400)
-    parser.add_argument("--count-samples", action="store_true", default=False)
-    parser.add_argument("--val-steps", type=int, default=200)
-    parser.add_argument("--progress", action="store_true", default=True)
-    parser.add_argument("--no-progress", action="store_false", dest="progress")
-    parser.add_argument("--learning-rate", type=float, default=3e-4)
-    parser.add_argument("--log-interval", type=int, default=50)
-    parser.add_argument("--var-batches", type=int, default=50)
+    loader = parser.add_argument_group("loader")
+    loader.add_argument("--batch-size", type=int, default=32, help="批大小")
+    loader.add_argument("--num-workers", type=int, default=0, help="WebDataset 工作进程数（Windows 建议 0）")
+    loader.add_argument("--shuffle-buf", type=int, default=1000, help="shuffle 缓冲区大小")
+    loader.add_argument("--seed", type=int, default=42, help="随机种子")
 
-    parser.add_argument("--n-hiddens", type=int, default=128)
-    parser.add_argument("--n-residual-hiddens", type=int, default=32)
-    parser.add_argument("--n-residual-layers", type=int, default=2)
-    parser.add_argument("--embedding-dim", type=int, default=64)
-    parser.add_argument("--n-embeddings", type=int, default=512)
-    parser.add_argument("--beta", type=float, default=0.25)
-    parser.add_argument("--input-channels", type=int, default=2)
+    vq = parser.add_argument_group("vqvae-train")
+    vq.add_argument("--epochs", type=int, default=10, help="VQ-VAE 训练轮数")
+    vq.add_argument("--steps-per-epoch", type=int, default=600, help="每轮的 batch 数（0=使用缓存/统计）")
+    vq.add_argument("--count-samples", action="store_true", default=False, help="当 steps-per-epoch <= 0 时统计训练集样本数")
+    vq.add_argument("--val-steps", type=int, default=400, help="每轮验证评估的 batch 数（0=使用缓存）")
+    vq.add_argument("--progress", action="store_true", default=True, help="显示进度条")
+    vq.add_argument("--no-progress", action="store_false", dest="progress", help="关闭进度条")
+    vq.add_argument("--val-random", action="store_true", default=True, help="验证集随机抽取（不放回）")
+    vq.add_argument("--no-val-random", action="store_false", dest="val_random", help="关闭验证集随机抽样")
+    vq.add_argument("--val-shuffle-buf", type=int, default=1000, help="验证集 shuffle 缓冲区大小")
+    vq.add_argument("--learning-rate", type=float, default=3e-4, help="学习率")
+    vq.add_argument("--log-interval", type=int, default=50, help="step 日志间隔")
+    vq.add_argument("--var-batches", type=int, default=50, help="估计方差的 batch 数")
+    vq.add_argument("--n-hiddens", type=int, default=128, help="编码器/解码器隐藏维度")
+    vq.add_argument("--n-residual-hiddens", type=int, default=32, help="残差块隐藏维度")
+    vq.add_argument("--n-residual-layers", type=int, default=2, help="残差层数")
+    vq.add_argument("--embedding-dim", type=int, default=64, help="码本向量维度")
+    vq.add_argument("--n-embeddings", type=int, default=128, help="码本大小")
+    vq.add_argument("--beta", type=float, default=0.25, help="承诺损失系数")
+    vq.add_argument("--input-channels", type=int, default=2, help="输入通道数")
 
-    parser.add_argument("--feature-out-dir", default="features")
-    parser.add_argument("--vqvae-out", default="results/vqvae_heatmap.pth")
-    parser.add_argument("--xgb-out", default="results/xgb_model.json")
-    parser.add_argument("--max-samples", type=int, default=0)
-    parser.add_argument("--no-normalize-hist", action="store_false", dest="normalize_hist")
+    enc = parser.add_argument_group("encoding")
+    enc.add_argument("--max-train-samples", type=int, default=4000, help="训练集最大编码样本数")
+    enc.add_argument("--max-val-samples", type=int, default=1000, help="验证集最大编码样本数")
+    enc.add_argument("--max-test-samples", type=int, default=1000, help="测试集最大编码样本数")
+    enc.add_argument("--no-normalize-hist", action="store_false", dest="normalize_hist", help="关闭码本直方图归一化")
     parser.set_defaults(normalize_hist=True)
 
-    parser.add_argument("--xgb-max-depth", type=int, default=6)
-    parser.add_argument("--xgb-eta", type=float, default=0.1)
-    parser.add_argument("--xgb-subsample", type=float, default=0.8)
-    parser.add_argument("--xgb-colsample", type=float, default=0.8)
-    parser.add_argument("--xgb-rounds", type=int, default=300)
-    parser.add_argument("--exclude-timeout-eval", action="store_true", default=True)
-    parser.add_argument("--include-timeout-eval", action="store_false", dest="exclude_timeout_eval")
+    xg = parser.add_argument_group("xgboost")
+    xg.add_argument("--xgb-max-depth", type=int, default=6, help="树深")
+    xg.add_argument("--xgb-eta", type=float, default=0.1, help="学习率")
+    xg.add_argument("--xgb-subsample", type=float, default=0.8, help="行采样率")
+    xg.add_argument("--xgb-colsample", type=float, default=0.8, help="列采样率")
+    xg.add_argument("--xgb-rounds", type=int, default=300, help="训练轮数")
+    xg.add_argument("--exclude-timeout-eval", action="store_true", default=True, help="评估时排除超时样本")
+    xg.add_argument("--include-timeout-eval", action="store_false", dest="exclude_timeout_eval", help="评估时包含超时样本")
 
     args = parser.parse_args()
 
@@ -378,13 +429,21 @@ def main():
 
     device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
 
+    cache = load_sample_cache(args.data_dir)
+    num_classes = 2 if args.task == "2class" else 3
+
     steps_per_epoch = args.steps_per_epoch
     if steps_per_epoch <= 0:
-        if not args.count_samples:
-            raise ValueError("steps_per_epoch is required unless --count-samples is set.")
-        train_count = count_samples(train_shards, label_key)
-        print(f"Samples | train={train_count}")
-        steps_per_epoch = max(1, (train_count + args.batch_size - 1) // args.batch_size)
+        cached = get_cache_steps(cache, "train", args.batch_size, num_classes)
+        if cached:
+            steps_per_epoch = cached
+            print(f"使用缓存：steps_per_epoch={steps_per_epoch}")
+        elif args.count_samples:
+            train_count = count_samples(train_shards, label_key)
+            print(f"Samples | train={train_count}")
+            steps_per_epoch = max(1, (train_count + args.batch_size - 1) // args.batch_size)
+        else:
+            raise ValueError("steps_per_epoch 未指定，且无缓存；请设置 --steps-per-epoch 或 --count-samples。")
 
     epoch_samples = steps_per_epoch * args.batch_size
     train_loader = make_loader(
@@ -413,7 +472,8 @@ def main():
         val_shards,
         label_key,
         args.batch_size,
-        shuffle=False,
+        shuffle=args.val_random,
+        shuffle_buf=args.val_shuffle_buf,
         num_workers=args.num_workers,
         repeat=False,
         drop_last=False,
@@ -441,14 +501,37 @@ def main():
         args.vqvae_out,
         args.progress,
         val_loader,
-        args.val_steps,
+        get_cache_steps(cache, "val", args.batch_size, num_classes) if args.val_steps <= 0 else args.val_steps,
     )
 
     os.makedirs(args.feature_out_dir, exist_ok=True)
-    val_loader = make_loader(val_shards, label_key, args.batch_size, shuffle=False, num_workers=args.num_workers)
-    test_loader = make_loader(test_shards, label_key, args.batch_size, shuffle=False, num_workers=args.num_workers)
+    val_loader = make_loader(
+        val_shards,
+        label_key,
+        args.batch_size,
+        shuffle=args.val_random,
+        shuffle_buf=args.val_shuffle_buf,
+        num_workers=args.num_workers,
+    )
+    test_loader = make_loader(
+        test_shards,
+        label_key,
+        args.batch_size,
+        shuffle=False,
+        num_workers=args.num_workers,
+    )
 
-    max_samples = args.max_samples if args.max_samples > 0 else None
+    max_train = args.max_train_samples
+    max_val = args.max_val_samples
+    max_test = args.max_test_samples
+    max_train = max_train if max_train > 0 else None
+    max_val = max_val if max_val > 0 else None
+    max_test = max_test if max_test > 0 else None
+    total_hint = max_train
+    if total_hint is None:
+        cached = get_cache_steps(cache, "train", args.batch_size, num_classes)
+        if cached:
+            total_hint = cached * args.batch_size
     X_train, y_train = encode_codebook_hist(
         make_loader(train_shards, label_key, args.batch_size, shuffle=False, num_workers=args.num_workers),
         model,
@@ -456,8 +539,16 @@ def main():
         args.n_embeddings,
         args.task,
         args.normalize_hist,
-        max_samples,
+        max_train,
+        args.progress,
+        "Encode train",
+        total_hint,
     )
+    total_hint = max_val
+    if total_hint is None:
+        cached = get_cache_steps(cache, "val", args.batch_size, num_classes)
+        if cached:
+            total_hint = cached * args.batch_size
     X_val, y_val = encode_codebook_hist(
         val_loader,
         model,
@@ -465,8 +556,16 @@ def main():
         args.n_embeddings,
         args.task,
         args.normalize_hist,
-        max_samples,
+        max_val,
+        args.progress,
+        "Encode val",
+        total_hint,
     )
+    total_hint = max_test
+    if total_hint is None:
+        cached = get_cache_steps(cache, "test", args.batch_size, num_classes)
+        if cached:
+            total_hint = cached * args.batch_size
     X_test, y_test = encode_codebook_hist(
         test_loader,
         model,
@@ -474,7 +573,10 @@ def main():
         args.n_embeddings,
         args.task,
         args.normalize_hist,
-        max_samples,
+        max_test,
+        args.progress,
+        "Encode test",
+        total_hint,
     )
 
     np.savez(os.path.join(args.feature_out_dir, "train_features.npz"), X=X_train, y=y_train)
@@ -510,6 +612,7 @@ def main():
         }
         eval_exclude = 2 if args.exclude_timeout_eval else None
 
+    print(f"Training XGBoost (samples: train={len(y_train)}, val={len(y_val)})...")
     booster = train_xgboost(X_train, y_train, X_val, y_val, params, args.xgb_rounds)
     os.makedirs(os.path.dirname(args.xgb_out) or ".", exist_ok=True)
     booster.save_model(args.xgb_out)
