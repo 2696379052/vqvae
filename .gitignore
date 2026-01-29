@@ -1,0 +1,8 @@
+__pycache__
+.serena/
+.vscode/
+**.swp 
+playground*
+results/
+.ipynb_checkpoints/
+samples/

@@ -1,0 +1,14 @@
+certifi
+cffi
+mkl-fft
+mkl-random
+numpy
+olefile
+Pillow
+pycparser
+six
+torch
+torchvision
+webdataset
+xgboost
+tqdm

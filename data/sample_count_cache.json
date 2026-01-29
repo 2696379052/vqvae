@@ -1,0 +1,20 @@
+{
+  "train_bs32_nc2": 21794,
+  "train_bs32_nc3": 21794,
+  "train_bs64_nc2": 10897,
+  "train_bs64_nc3": 10897,
+  "train_bs128_nc2": 5449,
+  "train_bs128_nc3": 5449,
+  "val_bs32_nc2": 2792,
+  "val_bs32_nc3": 2792,
+  "val_bs64_nc2": 1396,
+  "val_bs64_nc3": 1396,
+  "val_bs128_nc2": 698,
+  "val_bs128_nc3": 698,
+  "test_bs32_nc2": 2565,
+  "test_bs32_nc3": 2565,
+  "test_bs64_nc2": 1283,
+  "test_bs64_nc3": 1283,
+  "test_bs128_nc2": 642,
+  "test_bs128_nc3": 642
+}
