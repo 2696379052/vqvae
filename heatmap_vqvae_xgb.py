@@ -433,7 +433,7 @@ def main():
 
     vq = parser.add_argument_group("vqvae-train")
     vq.add_argument("--epochs", type=int, default=10, help="VQ-VAE 训练轮数")
-    vq.add_argument("--steps-per-epoch", type=int, default=600, help="每轮的 batch 数（0=使用缓存/统计）")
+    vq.add_argument("--steps-per-epoch", type=int, default=800, help="每轮的 batch 数（0=使用缓存/统计）")
     vq.add_argument("--count-samples", action="store_true", default=False, help="当 steps-per-epoch <= 0 时统计训练集样本数")
     vq.add_argument("--val-steps", type=int, default=400, help="每轮验证评估的 batch 数（0=使用缓存）")
     vq.add_argument("--progress", action="store_true", default=True, help="显示进度条")
@@ -453,9 +453,9 @@ def main():
     vq.add_argument("--input-channels", type=int, default=2, help="输入通道数")
 
     enc = parser.add_argument_group("encoding")
-    enc.add_argument("--max-train-samples", type=int, default=4000, help="训练集最大编码样本数")
-    enc.add_argument("--max-val-samples", type=int, default=1000, help="验证集最大编码样本数")
-    enc.add_argument("--max-test-samples", type=int, default=1000, help="测试集最大编码样本数")
+    enc.add_argument("--max-train-samples", type=int, default=80000, help="训练集最大编码样本数（0=全部）")
+    enc.add_argument("--max-val-samples", type=int, default=20000, help="验证集最大编码样本数（0=全部）")
+    enc.add_argument("--max-test-samples", type=int, default=20000, help="测试集最大编码样本数（0=全部）")
     enc.add_argument("--no-normalize-hist", action="store_false", dest="normalize_hist", help="关闭码本直方图归一化")
     parser.set_defaults(normalize_hist=True)
 
@@ -488,10 +488,12 @@ def main():
         X_test, y_test = test_data["X"], test_data["y"]
 
         if args.task == "2class":
-            uniq = np.unique(y_train)
+            uniq, counts = np.unique(y_train, return_counts=True)
+            print("Train label counts:", dict(zip(uniq.tolist(), counts.tolist())))
             if uniq.size < 2:
                 raise ValueError(
-                    f"2class training requires both labels 0/1, got {uniq.tolist()}."
+                    f"2class training requires both labels 0/1, got {uniq.tolist()}. "
+                    "请检查 max-train-samples 是否过小，或设置为 0 使用全量样本。"
                 )
             params = {
                 "objective": "binary:logistic",
@@ -679,8 +681,16 @@ def main():
         cached = get_cache_steps(cache, "train", args.batch_size, num_classes)
         if cached:
             total_hint = cached * args.batch_size
+    train_encode_shuffle = max_train is not None and max_train > 0
     X_train, y_train = encode_codebook_hist(
-        make_loader(train_shards, label_key, args.batch_size, shuffle=False, num_workers=args.num_workers),
+        make_loader(
+            train_shards,
+            label_key,
+            args.batch_size,
+            shuffle=train_encode_shuffle,
+            shuffle_buf=args.shuffle_buf,
+            num_workers=args.num_workers,
+        ),
         model,
         device,
         args.n_embeddings,
@@ -731,11 +741,12 @@ def main():
     np.savez(os.path.join(args.feature_out_dir, "test_features.npz"), X=X_test, y=y_test)
 
     if args.task == "2class":
-        uniq = np.unique(y_train)
+        uniq, counts = np.unique(y_train, return_counts=True)
+        print("Train label counts:", dict(zip(uniq.tolist(), counts.tolist())))
         if uniq.size < 2:
             raise ValueError(
                 f"2class training requires both labels 0/1, got {uniq.tolist()}. "
-                "Reduce filtering or increase samples."
+                "请检查 max-train-samples 是否过小，或设置为 0 使用全量样本。"
             )
         params = {
             "objective": "binary:logistic",
