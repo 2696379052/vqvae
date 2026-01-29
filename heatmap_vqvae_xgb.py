@@ -20,6 +20,11 @@ try:
 except Exception:
     tqdm = None
 
+try:
+    from sklearn.metrics import classification_report
+except Exception:
+    classification_report = None
+
 from models.vqvae import VQVAE
 
 
@@ -346,6 +351,59 @@ def accuracy(y_true, y_pred, exclude_label=None):
     return float((y_true == y_pred).mean())
 
 
+def classification_report_text(y_true, y_pred, labels, target_names):
+    if classification_report is None:
+        return None
+    return classification_report(
+        y_true,
+        y_pred,
+        labels=labels,
+        target_names=target_names,
+        digits=4,
+        zero_division=0,
+    )
+
+
+def find_threshold_for_recall_range(p_tp, y_true, recall_min, recall_max):
+    if p_tp is None or y_true is None:
+        return None
+    pos = (y_true == 1).astype(np.int64)
+    total_pos = int(pos.sum())
+    if total_pos == 0:
+        return None
+    order = np.argsort(-p_tp)
+    pos_sorted = pos[order]
+    tp_cum = np.cumsum(pos_sorted)
+    pred_cum = np.arange(1, len(pos_sorted) + 1)
+    recall = tp_cum / total_pos
+    precision = np.divide(
+        tp_cum, pred_cum, out=np.zeros_like(tp_cum, dtype=np.float32), where=pred_cum > 0
+    )
+    mask = (recall >= recall_min) & (recall <= recall_max)
+    if mask.any():
+        candidates = np.where(mask)[0]
+        best_idx = candidates[np.argmax(precision[mask])]
+    else:
+        mask2 = recall <= recall_max
+        if mask2.any():
+            candidates = np.where(mask2)[0]
+            best_idx = candidates[np.argmax(precision[mask2])]
+        else:
+            best_idx = int(np.argmax(precision))
+    return float(p_tp[order][best_idx])
+
+
+def tp_precision_recall(y_true, y_pred):
+    y_true = np.asarray(y_true)
+    y_pred = np.asarray(y_pred)
+    tp = int(((y_true == 1) & (y_pred == 1)).sum())
+    fp = int(((y_true == 0) & (y_pred == 1)).sum())
+    fn = int(((y_true == 1) & (y_pred == 0)).sum())
+    precision = tp / (tp + fp) if (tp + fp) > 0 else 0.0
+    recall = tp / (tp + fn) if (tp + fn) > 0 else 0.0
+    return precision, recall
+
+
 def train_xgboost(X_train, y_train, X_val, y_val, params, rounds):
     dtrain = xgb.DMatrix(X_train, label=y_train)
     dval = xgb.DMatrix(X_val, label=y_val)
@@ -409,8 +467,97 @@ def main():
     xg.add_argument("--xgb-rounds", type=int, default=300, help="训练轮数")
     xg.add_argument("--exclude-timeout-eval", action="store_true", default=True, help="评估时排除超时样本")
     xg.add_argument("--include-timeout-eval", action="store_false", dest="exclude_timeout_eval", help="评估时包含超时样本")
+    xg.add_argument("--xgb-only", action="store_true", default=False, help="仅训练 XGBoost（从 .npz 读取特征）")
+    xg.add_argument("--tp-recall-min", type=float, default=0.1, help="止盈召回率下限（阈值搜索）")
+    xg.add_argument("--tp-recall-max", type=float, default=0.8, help="止盈召回率上限（阈值搜索）")
 
     args = parser.parse_args()
+
+    if args.xgb_only:
+        train_npz = os.path.join(args.feature_out_dir, "train_features.npz")
+        val_npz = os.path.join(args.feature_out_dir, "val_features.npz")
+        test_npz = os.path.join(args.feature_out_dir, "test_features.npz")
+        for path in (train_npz, val_npz, test_npz):
+            if not os.path.exists(path):
+                raise FileNotFoundError(f"Missing feature file: {path}")
+        train_data = np.load(train_npz)
+        val_data = np.load(val_npz)
+        test_data = np.load(test_npz)
+        X_train, y_train = train_data["X"], train_data["y"]
+        X_val, y_val = val_data["X"], val_data["y"]
+        X_test, y_test = test_data["X"], test_data["y"]
+
+        if args.task == "2class":
+            uniq = np.unique(y_train)
+            if uniq.size < 2:
+                raise ValueError(
+                    f"2class training requires both labels 0/1, got {uniq.tolist()}."
+                )
+            params = {
+                "objective": "binary:logistic",
+                "eval_metric": "logloss",
+                "max_depth": args.xgb_max_depth,
+                "eta": args.xgb_eta,
+                "subsample": args.xgb_subsample,
+                "colsample_bytree": args.xgb_colsample,
+                "base_score": 0.5,
+            }
+            eval_exclude = -1
+        else:
+            params = {
+                "objective": "multi:softprob",
+                "num_class": 3,
+                "eval_metric": "mlogloss",
+                "max_depth": args.xgb_max_depth,
+                "eta": args.xgb_eta,
+                "subsample": args.xgb_subsample,
+                "colsample_bytree": args.xgb_colsample,
+            }
+            eval_exclude = 2 if args.exclude_timeout_eval else None
+
+        print(f"Training XGBoost (samples: train={len(y_train)}, val={len(y_val)})...")
+        booster = train_xgboost(X_train, y_train, X_val, y_val, params, args.xgb_rounds)
+        os.makedirs(os.path.dirname(args.xgb_out) or ".", exist_ok=True)
+        booster.save_model(args.xgb_out)
+
+        val_pred = booster.predict(xgb.DMatrix(X_val))
+        if args.task == "2class":
+            val_pred_label = (val_pred >= 0.5).astype(np.int64)
+        else:
+            val_pred_label = val_pred.argmax(axis=1)
+        val_acc = accuracy(y_val, val_pred_label, exclude_label=eval_exclude)
+
+        test_pred = booster.predict(xgb.DMatrix(X_test))
+        if args.task == "2class":
+            test_pred_label = (test_pred >= 0.5).astype(np.int64)
+        else:
+            test_pred_label = test_pred.argmax(axis=1)
+        test_acc = accuracy(y_test, test_pred_label, exclude_label=eval_exclude)
+
+        print("Val Acc (exclude timeout):", val_acc)
+        print("Test Acc (exclude timeout):", test_acc)
+
+        if args.task == "2class":
+            if classification_report is not None:
+                print("Val 分类报告（默认阈值）:")
+                print(classification_report_text(y_val, val_pred_label, [0, 1], ["SL", "TP"]))
+                print("Test 分类报告（默认阈值）:")
+                print(classification_report_text(y_test, test_pred_label, [0, 1], ["SL", "TP"]))
+            thr = find_threshold_for_recall_range(val_pred, y_val, args.tp_recall_min, args.tp_recall_max)
+            if thr is not None:
+                val_thr_pred = (val_pred >= thr).astype(np.int64)
+                test_thr_pred = (test_pred >= thr).astype(np.int64)
+                prec, rec = tp_precision_recall(y_val, val_thr_pred)
+                print(f"Val 阈值={thr:.4f} | 止盈 Precision={prec:.4f} Recall={rec:.4f}")
+                if classification_report is not None:
+                    print("Val 分类报告（阈值后）:")
+                    print(classification_report_text(y_val, val_thr_pred, [0, 1], ["SL", "TP"]))
+                prec_t, rec_t = tp_precision_recall(y_test, test_thr_pred)
+                print(f"Test 阈值={thr:.4f} | 止盈 Precision={prec_t:.4f} Recall={rec_t:.4f}")
+                if classification_report is not None:
+                    print("Test 分类报告（阈值后）:")
+                    print(classification_report_text(y_test, test_thr_pred, [0, 1], ["SL", "TP"]))
+        return
 
     train_shards = expand_patterns(args.train_shards) if args.train_shards else default_shards(args.data_dir, "train")
     val_shards = expand_patterns(args.val_shards) if args.val_shards else default_shards(args.data_dir, "val")
@@ -633,6 +780,27 @@ def main():
 
     print("Val Acc (exclude timeout):", val_acc)
     print("Test Acc (exclude timeout):", test_acc)
+
+    if args.task == "2class":
+        if classification_report is not None:
+            print("Val 分类报告（默认阈值）:")
+            print(classification_report_text(y_val, val_pred_label, [0, 1], ["SL", "TP"]))
+            print("Test 分类报告（默认阈值）:")
+            print(classification_report_text(y_test, test_pred_label, [0, 1], ["SL", "TP"]))
+        thr = find_threshold_for_recall_range(val_pred, y_val, args.tp_recall_min, args.tp_recall_max)
+        if thr is not None:
+            val_thr_pred = (val_pred >= thr).astype(np.int64)
+            test_thr_pred = (test_pred >= thr).astype(np.int64)
+            prec, rec = tp_precision_recall(y_val, val_thr_pred)
+            print(f"Val 阈值={thr:.4f} | 止盈 Precision={prec:.4f} Recall={rec:.4f}")
+            if classification_report is not None:
+                print("Val 分类报告（阈值后）:")
+                print(classification_report_text(y_val, val_thr_pred, [0, 1], ["SL", "TP"]))
+            prec_t, rec_t = tp_precision_recall(y_test, test_thr_pred)
+            print(f"Test 阈值={thr:.4f} | 止盈 Precision={prec_t:.4f} Recall={rec_t:.4f}")
+            if classification_report is not None:
+                print("Test 分类报告（阈值后）:")
+                print(classification_report_text(y_test, test_thr_pred, [0, 1], ["SL", "TP"]))
 
 
 if __name__ == "__main__":
