@@ -453,9 +453,11 @@ def main():
     vq.add_argument("--input-channels", type=int, default=2, help="输入通道数")
 
     enc = parser.add_argument_group("encoding")
-    enc.add_argument("--max-train-samples", type=int, default=80000, help="训练集最大编码样本数（0=全部）")
-    enc.add_argument("--max-val-samples", type=int, default=20000, help="验证集最大编码样本数（0=全部）")
-    enc.add_argument("--max-test-samples", type=int, default=20000, help="测试集最大编码样本数（0=全部）")
+    enc.add_argument("--max-train-samples", type=int, default=0, help="训练集最大编码样本数（0=全部）")
+    enc.add_argument("--max-val-samples", type=int, default=0, help="验证集最大编码样本数（0=全部）")
+    enc.add_argument("--max-test-samples", type=int, default=0, help="测试集最大编码样本数（0=全部）")
+    enc.add_argument("--encode-random", action="store_true", default=True, help="编码时随机抽样（不放回）")
+    enc.add_argument("--no-encode-random", action="store_false", dest="encode_random", help="编码时按顺序读取")
     enc.add_argument("--no-normalize-hist", action="store_false", dest="normalize_hist", help="关闭码本直方图归一化")
     parser.set_defaults(normalize_hist=True)
 
@@ -681,7 +683,7 @@ def main():
         cached = get_cache_steps(cache, "train", args.batch_size, num_classes)
         if cached:
             total_hint = cached * args.batch_size
-    train_encode_shuffle = max_train is not None and max_train > 0
+    train_encode_shuffle = args.encode_random
     X_train, y_train = encode_codebook_hist(
         make_loader(
             train_shards,
@@ -707,7 +709,14 @@ def main():
         if cached:
             total_hint = cached * args.batch_size
     X_val, y_val = encode_codebook_hist(
-        val_loader,
+        make_loader(
+            val_shards,
+            label_key,
+            args.batch_size,
+            shuffle=args.encode_random,
+            shuffle_buf=args.shuffle_buf,
+            num_workers=args.num_workers,
+        ),
         model,
         device,
         args.n_embeddings,
@@ -724,7 +733,14 @@ def main():
         if cached:
             total_hint = cached * args.batch_size
     X_test, y_test = encode_codebook_hist(
-        test_loader,
+        make_loader(
+            test_shards,
+            label_key,
+            args.batch_size,
+            shuffle=args.encode_random,
+            shuffle_buf=args.shuffle_buf,
+            num_workers=args.num_workers,
+        ),
         model,
         device,
         args.n_embeddings,
